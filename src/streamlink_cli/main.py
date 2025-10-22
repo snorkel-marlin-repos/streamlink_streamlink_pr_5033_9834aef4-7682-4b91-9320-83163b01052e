@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Type, Union
 import streamlink.logger as logger
 from streamlink import NoPluginError, PluginError, StreamError, Streamlink, __version__ as streamlink_version
 from streamlink.exceptions import FatalPluginError, StreamlinkDeprecationWarning
-from streamlink.plugin import Plugin, PluginOptions
+from streamlink.options import Options
+from streamlink.plugin import Plugin
 from streamlink.stream.stream import Stream, StreamIO
 from streamlink.utils.named_pipe import NamedPipe
 from streamlink.utils.times import LOCAL as LOCALTIMEZONE
@@ -530,8 +531,8 @@ def handle_url():
 
     try:
         pluginname, pluginclass, resolved_url = streamlink.resolve_url(args.url)
-        setup_plugin_options(streamlink, pluginname, pluginclass)
-        plugin = pluginclass(streamlink, resolved_url)
+        options = setup_plugin_options(pluginname, pluginclass)
+        plugin = pluginclass(streamlink, resolved_url, options)
         log.info(f"Found matching plugin {pluginname} for URL {args.url}")
 
         if args.retry_max or args.retry_streams:
@@ -711,63 +712,56 @@ def setup_streamlink():
 
 
 def setup_plugin_args(session: Streamlink, parser: ArgumentParser):
-    """Sets Streamlink plugin options."""
+    """Adds plugin argument data to the argument parser."""
 
     plugin_args = parser.add_argument_group("Plugin options")
     for pname, plugin in session.plugins.items():
-        defaults = {}
         group = parser.add_argument_group(pname.capitalize(), parent=plugin_args)
 
         for parg in plugin.arguments or []:
-            if not parg.is_global:
-                group.add_argument(parg.argument_name(pname), **parg.options)
-                defaults[parg.dest] = parg.default
-            else:
-                pargdest = parg.dest
-                for action in parser._actions:
-                    # find matching global argument
-                    if pargdest != action.dest:
-                        continue
-                    defaults[pargdest] = action.default
-
-        plugin.options = PluginOptions(defaults)
+            group.add_argument(parg.argument_name(pname), **parg.options)
 
 
-def setup_plugin_options(session: Streamlink, pluginname: str, pluginclass: Type[Plugin]):
-    """Sets Streamlink plugin options."""
-    if pluginclass.arguments is None:
-        return
+def setup_plugin_options(pluginname: str, pluginclass: Type[Plugin]) -> Options:
+    """Initializes plugin options from argument values."""
 
+    if not pluginclass.arguments:
+        return Options()
+
+    defaults = {}
+    values = {}
     required = {}
 
     for parg in pluginclass.arguments:
+        defaults[parg.dest] = parg.default
+
         if parg.options.get("help") == argparse.SUPPRESS:
             continue
 
-        value = getattr(args, parg.dest if parg.is_global else parg.namespace_dest(pluginname))
-        session.set_plugin_option(pluginname, parg.dest, value)
+        value = getattr(args, parg.namespace_dest(pluginname))
+        values[parg.dest] = value
 
-        if not parg.is_global:
-            if parg.required:
-                required[parg.name] = parg
-            # if the value is set, check to see if any of the required arguments are not set
-            if parg.required or value:
-                try:
-                    for rparg in pluginclass.arguments.requires(parg.name):
-                        required[rparg.name] = rparg
-                except RuntimeError:
-                    log.error(f"{pluginname} plugin has a configuration error and the arguments cannot be parsed")
-                    break
+        if parg.required:
+            required[parg.name] = parg
+        # if the value is set, check to see if any of the required arguments are not set
+        if parg.required or value:
+            try:
+                for rparg in pluginclass.arguments.requires(parg.name):
+                    required[rparg.name] = rparg
+            except RuntimeError:  # pragma: no cover
+                log.error(f"{pluginname} plugin has a configuration error and the arguments cannot be parsed")
+                break
 
-    if required:
-        for req in required.values():
-            if not session.get_plugin_option(pluginname, req.dest):
-                prompt = f"{req.prompt or f'Enter {pluginname} {req.name}'}: "
-                session.set_plugin_option(
-                    pluginname,
-                    req.dest,
-                    console.askpass(prompt) if req.sensitive else console.ask(prompt),
-                )
+    for req in required.values():
+        if not values.get(req.dest):
+            prompt = f"{req.prompt or f'Enter {pluginname} {req.name}'}: "
+            value = console.askpass(prompt) if req.sensitive else console.ask(prompt)
+            values[req.dest] = value
+
+    options = Options(defaults)
+    options.update(values)
+
+    return options
 
 
 def log_root_warning():
